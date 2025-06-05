@@ -1,0 +1,554 @@
+---
+title: "Project"
+output: html_document
+date: "2025-03-02"
+---
+# Bibliotecas
+```{r}
+options(warn = -1)
+
+library(roxygen2)
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(rminer)
+library(fpp)
+library(e1071)
+library(reshape2)
+library(patchwork)
+library(tidyverse)
+library(xgboost)
+```
+
+## Functions
+```{r}
+bass_model <- function(p,q,t, amplitude, noise_sd, freq, phase) {
+  #' Bass Model Function
+  #' 
+  #' This function implements the Bass model, used to model the adoption of innovations over time.
+  #' 
+  #' @param p -> Adoption rate parameter by innovation (innovators), between 0 and 1. Represents the probability of an individual adopting the innovation due to the influence of innovative individuals.
+  #' 
+  #' @param q -> Adoption rate parameter by imitation (imitators), between 0 and 1. Represents the probability of an individual adopting the innovation due to the social influence of other adopters.
+  #' 
+  #' @param t -> Time, usually in units of time such as years or months, which indicates how long the innovation has been available.
+  #' 
+  #' @return Returns the cumulative fraction of the population that adopted the innovation at time \( t \).
+  #' 
+  #' @examples
+  #' bass_model(0.03, 0.38, 10)
+  #' bass_model(0.05, 0.25, 5)
+  #' 
+  #' @export 
+  res = (exp((p+q)*t)*p*(p+q)^2)/(p*exp((p+q)*t)+q)^2
+}
+
+
+# Function to add seasonality and noise
+add_seasonality_and_noise <- function(adoption, week, amplitude, noise_sd, freq, phase) {
+  seasonal_factor <- amplitude * sin(2 * pi * week * freq + phase)          # Seasonal factor
+  noise <- rnorm(length(week), mean = 0, sd = noise_sd) * adoption * 0.05   # Continuous noise
+
+  # Occasional sales peaks
+  if (runif(1) < freq) {
+    noise <- noise + rnorm(1, mean = 0, sd = noise_sd)                      # Larger peaks
+  }
+
+  # Return to adoption with seasonality and noise, ensuring that there are no negative values
+  return(pmax(adoption * (1 + seasonal_factor) + noise, 0))                 # Make sure it's not negative
+}
+
+nmae <- function(real_y, pred_y) {
+  nmae <- (mean(abs(real_y - pred_y))/(median(real_y)))*100
+  return(nmae)
+}
+
+mae <- function(real_y, pred_y) {
+  mae <- mean(abs(real_y - pred_y))
+  
+  return(mae)
+}
+
+mase <- function(real_y, pred_y, train_y) {
+  mae_pred <- mean(abs(real_y - pred_y))
+  mae_naive <- mean(abs(diff(train_y)))
+  
+  return(mae_pred / mae_naive)
+}
+
+get_valid_lags <- function(data, number_horizons = 10) {
+  all_lags <- colnames(data)[startsWith(colnames(data), "lag")]
+
+  valid_lags_list <- list()
+
+  for (h in 1:number_horizons) {
+    if (h == 1) {
+      valid_lags <- rev(all_lags)  # Horizon 1 use every lags
+    } else {
+      valid_lags <- paste0("lag", h:length(all_lags))
+    }
+
+    valid_lags_list[[paste0("h", h)]] <- valid_lags
+  }
+
+  return(valid_lags_list)
+}
+```
+
+This code cell, creates 2 functions:
+
+`bass_model` function <- Shows how the information of the first few periods of sales data may be used to develop a fairly good forecast. It shows an idea of how th products can be, leading to a close real-life problem.
+
+`add_seasonality_and_noise` function <- It creates de seasonality and noisy data, that every real-life problems got. In other words.
+
+# Simulate 1 Product
+```{r}
+m <- 300000
+q <- 0.027256999
+p <- 0.001143
+
+t <- seq(1, 260)
+
+adoptions = m * bass_model(p,q,t)
+
+plot(t, adoptions, type="l",col="blue",lwd=3,xlab="Time (years)",ylab="Adoptions")
+```
+
+# Simulate for 1 Products
+```{r}
+# Generate the weeks (time)
+t <- seq(1, 260)
+
+# Defining parameters for the Bass model
+m <- 300000  # Maximum adoption
+q <- 1/100  # Imitation rate
+p <- 1/700  # Innovation rate
+
+# Calculating adoption using the Bass model
+adoptions_1 <- m * bass_model(p, q, t)
+
+# Add seasonality and noise
+adoption_with_noise <- add_seasonality_and_noise(adoption = adoptions_1, week = t, noise_sd = 1.3, phase = 0, amplitude = 0.1, freq = 1/30)
+
+# Plotting the graph with seasonality and noise
+plot(t, adoption_with_noise, type = "l", col = "blue", lwd = 3, 
+     xlab = "Weeks", ylab = "Adoptions", main = "Adoptions with Seasonality and Noise for 1 Product")
+```
+
+# Create DataFrame
+```{r}
+# Number of Products
+num_prod <- 50
+
+# Initial Date
+start_date = as.Date("2010-12-31")
+
+# Creating dataframe with the weeks
+weeks <- seq(start_date, by="week", length.out = 260)
+adoptions_df <- data.frame(weeks)
+```
+
+# Simulate for 50 Products
+```{r}
+t <- seq(1, 260, by = 1)
+
+# p           1/700 -> 1/300
+# q           1/100 -> 1/50
+# amplitude   0.02 -> 0.1
+# freq        1/30 -> 1/15
+# noise       0.2 -> 0.6
+
+for (i in 1:num_prod) {
+  # Generate the parameters for each product
+  p <- runif(1, min = 1/700, max = 1/300)
+  q <- runif(1, min = 1/100, max = 1/50)
+  m <- runif(1, min = 100000, max = 100000)
+  amplitude <- runif(1, min = 0.02, max = 0.1)
+  freq <- runif(1, min = 1/30, max = 1/15)
+  noise <- runif(1, min = 0.7, max = 1.3)
+
+  adoption_bass <- m * bass_model(p, q, t)
+
+  adoption_with_noise <- add_seasonality_and_noise(
+    adoption = adoption_bass,
+    week = t,
+    amplitude = amplitude,
+    noise_sd = noise,
+    freq = freq,
+    phase = 0
+  )
+  # Add the adoption values to the matrix
+  adoptions_df[[paste("Product", i)]] <- round(adoption_with_noise, digits=0)
+}
+```
+
+# Time Series Analysis
+```{r}
+options(warn = -1) # Remove the warnings
+
+num_prod <- 50 # Number of Products
+maxLag <- 20 # Max number of Lags
+max_horizon <- 10 # Max number of Horizons
+num_iteractions <- 6 # Number of iteractions it is used to predict
+
+models_list <- c("ARIMA", "ETS", "SVM", "Theta", "XGBoost")
+errors_growing_list_nmae <- list()
+errors_growing_list_mae <- list()
+
+# Monte Carlo Random Shocks
+random_shock <- seq(from = 0.0, to = 0.60, by = 0.10)
+errors_scenario_list <- list()
+
+# Vectors to save the errors for each product
+errors_products_list = list()
+
+# Parameters for XGBoost
+params <- list(
+  objective = "reg:squarederror",
+  max_depth = 4,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  gamma = 0,
+  verbosity = 1
+)
+
+# Add the columns and their names
+for(model in models_list) {
+    errors_scenario_list[[model]] <- matrix(
+      NA,
+      nrow = length(random_shock),
+      ncol = max_horizon,
+      dimnames = list(paste0("scenario", 1:length(random_shock)),
+                      paste0("H", 1:max_horizon)
+                      )
+    )
+  }
+
+
+# Vector that contais the mean of each product
+demand_products_mean <- c()
+
+# Creating vectors for each iteractions
+predictions_arima <- c()
+predictions_theta <- c()
+predictions_ets <- c()
+predictions_svm <- c()
+predictions_xgb <- c()
+
+# Iterating in the products
+for (s in 1:length(random_shock)) {
+  cat("Scenario", s, "\n")
+
+  for (model in models_list) {
+    errors_products_list[[model]] <- matrix(
+      NA,
+      nrow = num_prod,
+      ncol = max_horizon,
+      dimnames = list(paste0("Product", 1:num_prod),
+                      paste0("h", 1:max_horizon))
+      )
+  }
+
+  for (i in 1:num_prod) {
+    cat("Product: ", i, "\n")
+    # Uni-Variated Algorithms
+    # Creating the dataframe product i
+    data <- adoptions_df[, c(1, i+1)]
+    applied_shocks <- abs(round(data[, 2] + rnorm(length(data[, 2]), 0, data[,2] * random_shock[s]), 0))
+    demand_products_mean[i] <- mean(applied_shocks)
+    data_series <- ts(data = applied_shocks, start = 1, end = 260)
+
+    growing_dates <- c()
+
+    # Vectors to store the error for each iteraction of the incremental (6 iteractions)
+    for (model in models_list) {
+      errors_growing_list_nmae[[model]] <- matrix(
+        NA,
+        nrow = num_iteractions,
+        ncol = max_horizon,
+        dimnames = list(paste0("iter", 1:num_iteractions),
+                        paste0("h", 1:max_horizon)
+                        )
+      )
+      
+      errors_growing_list_mae[[model]] <- matrix(
+        NA,
+        nrow = num_iteractions,
+        ncol = max_horizon,
+        dimnames = list(paste0("iter", 1:num_iteractions),
+                        paste0("h", 1:max_horizon)
+                        )
+      )
+    }
+
+    # ----- Split Data (Train, Test) - Incrementation -----
+    for (j in 1 : 6) {
+      cat("Iteraction (Univariated Models): ", j, "\n")
+      indexes_no_lags <- holdout(1 : length(data_series), # Proportion of the classes
+                                 ratio = 10,              # Number of the Test Size
+                                 mode = "incremental",    # Type of the holdout in use
+                                 increment = 10,          # Number of samples slided at each iteration
+                                 iter = j,                # Rolling Iteration
+                                 window = 200 
+                                 )
+      real_univariated <- data_series[indexes_no_lags$ts]
+
+      # Save the date
+      growing_dates[j] <- as.character(data$weeks)[tail(indexes_no_lags$tr, 1)]
+
+      # ----- Train and Predict -----
+      # Auto.ARIMA Algorithm
+      arima_model <- auto.arima(data_series[indexes_no_lags$tr])
+      arima_pred <- forecast(arima_model, h = 10)
+      predictions_arima <- c(predictions_arima, round(as.numeric(arima_pred$mean), 0))
+
+      # Thetaf Algorithm
+      theta_model <- thetaf(data_series[indexes_no_lags$tr])
+      theta_pred <- forecast(theta_model, h = 10)
+      predictions_theta <- c(predictions_theta, round(as.numeric(theta_pred$mean), 0))
+
+      # ETS (Exponential Smoothing)
+      ets_model <- ets(data_series[indexes_no_lags$tr])
+      ets_pred <- forecast(ets_model, h = 10)
+      predictions_ets <- c(predictions_ets, round(as.numeric(ets_pred$mean), 0))
+
+
+      # ----- Measuring the errors of the models -----
+      for (h in 1:max_horizon) {
+        # Auto.ARIMA
+        arima_pred_value <- round(as.numeric(arima_pred$mean[h]), 0)
+        arima_error_nmae <- round(nmae(real_y = real_univariated[h], pred_y = arima_pred_value), 2)
+        arima_error_mae <- round(mae(real_y = real_univariated[h], pred_y = arima_pred_value), 2)
+
+        errors_growing_list_nmae$ARIMA[j, h] <- arima_error_nmae
+        errors_growing_list_mae$ARIMA[j, h] <- arima_error_mae
+
+        # Theta
+        theta_pred_value <- round(as.numeric(theta_pred$mean[h]), 0)
+        theta_error_nmae <- round(nmae(real_y = real_univariated[h], pred_y = theta_pred_value), 2)
+        theta_error_mae <- round(mae(real_y = real_univariated[h], pred_y = theta_pred_value), 2)
+
+        errors_growing_list_nmae$Theta[j, h] <- theta_error_nmae
+        errors_growing_list_mae$Theta[j, h] <- theta_error_mae
+        
+        # ETS (Exponential Smoothing)
+        ets_pred_value <- round(as.numeric(ets_pred$mean[h]), 0)
+        ets_error_nmae <- round(nmae(real_y = real_univariated[h], pred_y = ets_pred_value), 2)
+        ets_error_mae <- round(mae(real_y = real_univariated[h], pred_y = ets_pred_value), 2)
+
+        errors_growing_list_nmae$ETS[j, h] <- ets_error_nmae
+        errors_growing_list_mae$ETS[j, h] <- ets_error_mae
+      }
+    }
+
+    # Multivariated Algorithms
+    # Creating the lags
+    data_window <- cbind(CasesSeries(applied_shocks,1:maxLag),week=data$weeks[-(1:maxLag)]) # Data with the lags, week and demand
+    data_lag <- data_window[, which(!names(data_window)=="week")] # The data without the weeks column
+    lag_columns <- colnames(data_lag)[startsWith(colnames(data_lag), "lag")] # Lag Columns
+
+    for (k in 1 : 6) {
+      cat("Iteraction (for multivariated): ", k, "\n")
+      index_with_lags <- holdout(1: nrow(data_lag),
+                                 ratio = 10,
+                                 mode = "incremental",
+                                 increment = 10,
+                                 iter = k,
+                                 window = length(1:(which(data_window$week==growing_dates[1]))) # This needs to start at the same date as the previous holdout before
+                                 )
+      real_multi <- data_lag$y[index_with_lags$ts]
+
+      # Iterate for each Horizon
+      for (h in 1:max_horizon) {
+        cat("Horizon: ", h, "\n")
+        # Get the label 
+        label_xgboost <- which(names(data_lag) == "y")
+
+        valid_lags = get_valid_lags(data = data_lag)[[h]]
+
+        # Get the columns that only can be in the test set
+        columns <- which(names(data_lag) %in% valid_lags | names(data_lag) == "y")
+        # Get the feature for XGBoost (eveything withou "y")
+        columns_xgboost <- which(names(data_lag) %in% valid_lags & !names(data_lag) == "y")
+
+        # Creating the Dmatrix for XGBoost Model
+        x_train <- data_lag[index_with_lags$tr, columns_xgboost]
+        y_train <- data_lag[index_with_lags$tr, label_xgboost]
+        x_test <- data_lag[index_with_lags$ts[h], columns_xgboost]
+        y_test <- data_lag[index_with_lags$ts[h], label_xgboost]
+
+        d_train <- xgboost::xgb.DMatrix(data = as.matrix(x_train), label = y_train)
+        d_test <- xgboost::xgb.DMatrix(data = as.matrix(x_test))
+
+
+        # ------ Train and Predict ------
+        # SVM (Support Vector Machine) Algorithm
+        svm_model <- svm(y ~., data = data_lag[index_with_lags$tr, columns])
+        svm_pred <- round(as.numeric(predict(svm_model, data_lag[index_with_lags$ts[h], columns])), 0)
+        predictions_svm <- c(predictions_svm, as.numeric(svm_pred))
+
+        #XGBoost
+        xgb_model <- xgboost::xgb.train(
+          params = params,
+          data = d_train,
+          nrounds = 100
+        )
+        xgb_pred <- round(as.numeric(predict(xgb_model, d_test)), 0)
+        predictions_xgb <- c(predictions_xgb, as.numeric(xgb_pred))
+
+
+        # ------ Measuring the errors of the models ------
+        # SVM
+        svm_error_nmae <- round(nmae(real_y = real_multi[h], pred_y = svm_pred), 2)
+        svm_error_mae <- round(mae(real_y = real_multi[h], pred_y = svm_pred), 2)
+
+        errors_growing_list_nmae$SVM[k, h] <- svm_error_nmae
+        errors_growing_list_mae$SVM[k, h] <- svm_error_mae
+
+        # XGBoost
+        xgb_error_nmae <- round(nmae(real_y = real_multi[h], pred_y = xgb_pred), 2)
+        xgb_error_mae <- round(mae(real_y = real_multi[h], pred_y = xgb_pred), 2)
+
+        errors_growing_list_nmae$XGBoost[k, h] <- xgb_error_nmae
+        errors_growing_list_mae$XGBoost[k, h] <- xgb_error_mae
+      }
+    }
+
+    # Save the errors for each Scenario
+    errors_products_list$ARIMA[i, ] <- round(colMeans(errors_growing_list_mae$ARIMA), 2)
+    errors_products_list$Theta[i, ] <- round(colMeans(errors_growing_list_mae$Theta), 2)
+    errors_products_list$ETS[i, ] <- round(colMeans(errors_growing_list_mae$ETS), 2)
+    errors_products_list$SVM[i, ] <- round(colMeans(errors_growing_list_mae$SVM), 2)
+    errors_products_list$XGBoost[i, ] <- round(colMeans(errors_growing_list_mae$XGBoost), 2)
+  }
+  # Save the errors for each Product in each scenario
+  errors_scenario_list$ARIMA[s, ] <- round(colMeans(errors_products_list$ARIMA), 2)
+  errors_scenario_list$ETS[s, ] <- round(colMeans(errors_products_list$ETS), 2)
+  errors_scenario_list$Theta[s, ] <- round(colMeans(errors_products_list$Theta), 2)
+  errors_scenario_list$SVM[s, ] <- round(colMeans(errors_products_list$SVM), 2)
+  errors_scenario_list$XGBoost[s, ] <- round(colMeans(errors_products_list$XGBoost), 2)
+
+  cat("End Scenario", s, "\n")
+  cat("-------------------\n")
+}
+```
+
+
+## Save the errors into a DatFrame (mean, median and standard-deviation)
+```{r}
+models <- names(errors_scenario_list)
+horizons <- colnames(errors_scenario_list[[1]])
+num_models <- length(models)
+num_horizons <- length(horizons)
+
+# Initialize Dataframe
+errors_df <- as.data.frame(
+  matrix(list(), nrow = num_models, ncol = num_horizons),
+  stringsAsFactors = FALSE
+)
+rownames(errors_df) <- models
+colnames(errors_df) <- horizons
+
+# Add the errors
+for (model in models) {
+  for (h in horizons) {
+    errors_df[model, h][[1]] <- list(as.numeric(errors_scenario_list[[model]][, h]))
+  }
+}
+```
+
+
+## Visualize the Errors per Horizon and Iteraction - Results 1
+```{r}
+# Transform dataframe in a long format
+long_df <- errors_df %>%
+  rownames_to_column("Model") %>%
+  pivot_longer(-Model, names_to = "Horizon", values_to = "Errors") %>%
+  unnest(Errors)
+
+# Create the boxplots
+ggplot(long_df, aes(x = Model, y = Errors, fill = Model)) +
+  geom_boxplot() +
+  facet_wrap(~ Horizon, ncol = 5) +
+  theme_minimal() +
+  labs(
+    title = "Error Distribution by Model and Horizon (Monte Carlo)",
+    x = "Model",
+    y = "Error (MAE)"
+    )
+```
+
+The chart shows the **distribution of the mean absolute error (MAE)** for five forecasting models — **ARIMA, ETS, SVM, Theta, and XGBoost** — across ten forecasting horizons (H1 to H10), based on Monte Carlo simulations.
+
+This type of chart is useful because it allows for the comparison of model performance across different horizons, the assessment of model robustness through the dispersion of errors, and the identification of which models maintain consistency over time.
+
+The ETS and Theta models stand out for having the lowest median error values and the least variability, making them the most robust and reliable for this task. XGBoost, on the other hand, showed the highest error and dispersion, making it the least suitable model in this context. The SVM model also performed poorly, with high errors and low consistency. ARIMA had intermediate performance — not as strong as ETS and Theta, but better than SVM and XGBoost.
+
+It is also worth noting that there is no clear increase in error across the forecasting horizons, which may indicate stable temporal patterns in the data or good model adaptation.
+
+In summary, ETS and Theta are the most recommended models for forecasting in this scenario
+
+## Create the Dataframe to store only the errors per scenario
+```{r}
+num_scenarios <- length(random_shock)
+num_models <- length(models_list)
+
+# Create the Dataframe
+errors_scenario_mean <- as.data.frame(
+  matrix(NA, ncol = num_models, nrow = num_scenarios),
+  stringsAsFactors = FALSE
+)
+rownames(errors_scenario_mean) <- paste0("scenario", 1:num_scenarios)
+colnames(errors_scenario_mean) <- models_list
+
+# Add the errors
+for (model in models_list) {
+  for (s in 1:num_scenarios) {
+    errors_scenario_mean[s, model] <- round(mean(errors_scenario_list[[model]][s, ]), 2)
+  }
+}
+```
+
+## Visualize the errros per scenario and model - Results 2
+```{r}
+# Transform in long format
+errors_long <- errors_scenario_mean %>%
+  rownames_to_column(var = "Scenario") %>%
+  pivot_longer(
+    cols = -Scenario,
+    names_to = "Model",
+    values_to = "Error"
+  )
+
+# Create the plot
+ggplot(errors_long, aes(x = Scenario, y = Error, group = Model, color = Model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Model Robustness by Shock Level (Monte Carlo)",
+    x = "Scenario",
+    y = "MAE",
+    color = "Model"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", size = 16)
+  )
+```
+
+The chart shows the evolution of the **mean absolute error (MAE)** for five forecasting models — ARIMA, ETS, SVM, Theta, and XGBoost — across seven simulated scenarios with increasing levels of shock, using Monte Carlo simulations, just like in the previous boxplot analysis.
+
+This visualization is useful for assessing the **robustness of forecasting models under adverse conditions**, helping us understand how each model's error evolves as the input data becomes more unstable or unpredictable.
+
+As expected, all models exhibit a progressive increase in error as the shock level intensifies. However, the **rate and magnitude of error growth** vary significantly between models, revealing key differences in their resilience.
+
+The **ETS and Theta models** consistently achieve the **lowest error levels across all scenarios**, demonstrating superior robustness to external shocks. The **ARIMA** model also performs well, maintaining stable and controlled errors throughout.
+
+In contrast, the **SVM and especially the XGBoost models** show a steep rise in error as scenarios become more extreme, indicating lower **adaptability and reduced stability** in volatile environments.
+
+In summary, when dealing with data affected by shocks or instability, **ETS, Theta, and ARIMA** emerge as the most robust and reliable models, whereas **SVM and XGBoost** are more vulnerable to disruptions in the data.
+
+
+
